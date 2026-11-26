@@ -1,88 +1,145 @@
-# Severity-Aware Conformal Prediction
+# Efficient Decision Rules under Multiple Risk Constraints
 
-**How to Weight Probability and Loss**
+**Sung In (David) Cho** · Writing sample · [Paper (PDF)](paper/writing_sample.pdf) · [One-page summary](paper/summary.pdf)
 
-Code for a review rule that controls two risks at once. A case is sent to human review unless it is safe to approve. The rule bounds the share of adverse cases that pass unreviewed (coverage) and the expected loss they cause (severity), and sends as few cases to review as possible.
+---
 
-The paper is in [`paper/severity_aware_conformal_prediction.pdf`](paper/severity_aware_conformal_prediction.pdf), with a one-page summary in [`paper/summary.pdf`](paper/summary.pdf).
+## Research agenda
 
-## Main results
+My research develops **efficient decision rules that integrate predictions with multiple risks and costs while maintaining reliability under changing conditions.**
 
-- **Optimal rule.** With the default probability $p$ and the expected loss given default $c$ known, the optimal rule thresholds the blended score $h_\theta = (1-\theta)\,p + \theta\,pc/B$. The optimal weight $\theta^*$ is unique, equals one when only severity binds and zero when only coverage binds, and decreases strictly in the severity level in between.
-- **Estimation with exact guarantees.** The weight is estimated without labels from a plug-in dual linear program. Conformal risk control on the blended score keeps both guarantees in finite samples for any estimated weight. The excess share sent to review vanishes as the samples grow and the estimates of $p$ and $c$ improve.
-- **LendingClub loan dataset.** At a severity level of \$60 per applicant and a coverage level of 10%, the method sends 74.5% of applicants to review, against 77.0% to 93.3% for four other rules that meet both levels.
+| | Question | Status |
+|---|---|---|
+| **1. Efficiency under multiple risks** | When a decision must keep several risk limits at once, which risks must the rule combine, and how can it be set with few outcome labels so that every limit still holds? | **This paper** |
+| **2. Reliability under changing conditions** | How can such a rule keep its limits when the cases it is calibrated on differ from the cases it decides? | **Next.** The paper isolates the two forms of this problem and states the question below. |
+
+> **Next research question.** How can decision rules be calibrated to control multiple risks when policy-dependent selection makes the cases with observed outcomes differ from the population to which the rule is applied?
+
+---
+
+## This paper in brief
+
+Predictive models increasingly decide which cases to pass automatically and which to hold back. For example, a lender approves some loan applications and sends the rest to review. Such deployments come with limits on **several risks at once**:
+- how often adverse cases are passed,
+- how much they cost once passed,
+- how often other unwanted events occur.
+
+Conformal methods can calibrate a rule so that several limits hold in finite samples. However, they take the **score** that ranks the cases as given. In practice that score usually ranks by a single risk, with other limits imposed by separate cut-offs. Such rules stop when one limit is reached and leave the others partly unused.
+
+We study the problem
+
+$$\max_{\phi}\ \mathbb{E}[\phi(X)] \quad \text{s.t.} \quad \mathbb{E}[\phi(X)\,\ell_k(X)] \le a_k,\qquad k=1,\dots,K,$$
+
+whose solution passes the cases with $\sum_k \lambda_k \ell_k(x) < 1$ for prices $\lambda_k \ge 0$. This form follows from the generalized Neyman–Pearson lemma.
+
+**Contributions**
+
+1. **Which risks the score must combine.** Every linear score of the risks that leaves out a risk with a positive price passes strictly fewer cases. A risk with a zero price can be left out at no cost. For two risks, the prices can be read from the two standard single-risk rules.
+2. **A procedure that spends labels only on calibration.** The prices, and with them the score's weights, are read from a plug-in linear program on new cases **without outcomes**. The cut-off is set by conformal risk control (CRC) for all constraints at once. Under exchangeability, each expected risk stays below its level in finite samples, for any estimates.
+3. **Evidence.** The paper uses simulations with two and three risks and LendingClub loans with two risks. They show that combining risks pays exactly where the prices are positive, how much better estimates of each risk are worth, and when choosing the weights on outcome labels pays instead.
+
+---
+
+## What the paper answers, and what remains
+
+| Answered | Not answered (yet) |
+|---|---|
+| Which risks the optimal score must combine: those with positive prices. Shown within linear scores, under a non-degeneracy condition. | Whether plug-in prices recover the true set of positive prices in general. In the experiments they did so in every repetition, but there is no theorem. |
+| How to set the weights without labels and the cut-off with CRC, with a finite-sample guarantee in expectation under exchangeability. | A high-probability guarantee. Learn-then-test is the natural route. |
+| When this beats weights chosen on labels: when labels are scarce, or (in simulation) when the estimates carry no systematic bias. | More than two risks on real data. The real-data evidence comes from one lender and from approved loans only. |
+| How much better estimates are worth. In this design, errors in the probability of an adverse outcome cost more than errors in the loss. | **Temporal shift.** Calibrated on 2014 loans, every rule that uses a limit in full exceeds it in 2015, as risk rose. |
+| | **Policy-dependent selection.** Outcomes exist only for cases a past rule passed. A guarantee on them does not carry over to all applicants. This is the next research question above. |
+
+---
+
+## Key results
+
+| Setting | Finding |
+|---|---|
+| Two risks, simulation | Both prices are positive at 27 of 40 severity levels. There, the combined score passes **6.3 pp** more than the better single-risk score on average (up to 10.1 pp). Elsewhere it gains nothing. |
+| Three risks, simulation | Where all three prices are positive, the combined score passes **3.5 pp** more than the best score that drops one risk on average (up to 8.0 pp). Where only two prices are positive, the gain is ≤ 0.012 pp. After calibration, all three limits hold. |
+| Value of better estimates | In this design, noise and bias in $\hat p$ cost more than the same errors in $\hat c$. For example, noise of σ = 1 on the logit scale costs 8.9 pp for $\hat p$ against 2.3 pp for $\hat c$. |
+| LendingClub, random split ($40 per applicant) | The plug-in prices pass **3.5 pp** more than the better single-risk score and 8.1 pp more than separate cut-offs, and both limits hold. |
+| LendingClub, labels | Up to 10k labeled loans, plug-in prices win, because no labels are spent on the weights. From about 20k, weights chosen on labels win by 0.6–1.0 pp, because they correct an under-estimation bias in 2015. |
+| LendingClub, temporal split | Calibrated on 2014 loans, the plug-in rule uses 116% of the coverage level and 136% of the severity level in 2015. |
 
 <p align="center">
-  <img src="results/lendingclub/fig_lc_frontier.png" width="85%"><br>
-  <em>Share sent to review against the uncovered loss and the high-loss defaults left uncovered, 2015 loans.</em>
+  <img src="results/simulation/fig_levels.png" width="85%"><br>
+  <em>Two risks (simulation). Shaded: severity levels at which both prices are positive. The combined score gains exactly there.</em>
 </p>
 
-<p align="center">
-  <img src="results/lendingclub/fig_lc_weight.png" width="85%"><br>
-  <em>The estimated weight across severity levels and its gap to the best weight on the test loans.</em>
-</p>
+---
 
-## Repository
+## Repository layout
 
 ```
+paper/
+  writing_sample.pdf       the paper
+  summary.pdf              one-page summary
 src/
-  simulation.py            simulation study (Sections 3 and 5, Appendix C)
-  lendingclub.py           LendingClub experiments (Section 6, Discussion)
-  prepare_lendingclub.py   filter the raw LendingClub file (Appendix D)
-  train_models.py          fit p_hat and c_hat with LightGBM (Appendix D)
-  lc_data.py, splits.py    constants and sample splits
-paper/                     the paper and its one-page summary (PDF)
+  simulation.py            all simulation experiments (two and three risks, value of estimates)
+  prepare_lendingclub.py   LendingClub preprocessing: 36-month terminated loans, 2012–2015
+  splits.py                train / validation / pre-2015 hold set / 2015 pool
+  train_models.py          LightGBM models for p̂ and ĉ; predictions on the pool and hold set
+  lc_data.py               shared constants and the U / calibration / test split of 2015 loans
+  lendingclub.py           all LendingClub experiments
 results/
-  simulation/              figures and saved data of the simulation study
-  lendingclub/             figures and summary tables of Section 6
-REPRODUCE.md               one command per figure, table and number of the paper
+  simulation/              figures and csv files of the simulations
+  lendingclub/             figures and csv files of the LendingClub experiments
+data/                      not tracked (see below)
 ```
 
-## Setup
+---
 
-```
+## Reproducing the results
+
+### Setup
+
+```bash
 pip install -r requirements.txt
 ```
 
-The LendingClub loan dataset is not redistributed here. Download `accepted_2007_to_2018Q4.csv` from the [Lending Club dataset on Kaggle](https://www.kaggle.com/datasets/wordsforthewise/lending-club) and place it in `data/raw/`. Then
+### Simulations
 
-```
-mkdir -p data/raw data/processed
-python src/prepare_lendingclub.py --raw data/raw/accepted_2007_to_2018Q4.csv
-python src/train_models.py
-python src/lendingclub.py run --n 100
-python src/simulation.py fig1a
-```
+No data needed. Outputs go to `results/simulation/`.
 
-[`REPRODUCE.md`](REPRODUCE.md) maps every figure, table and number of the paper to its command.
-
-## References
-
-Papers cited in the accompanying paper, with links to the publisher or arXiv version.
-
-| # | Reference | Link |
+| Paper | Command | Output |
 |---|---|---|
-| 1 | Andrews (1999). Estimation when a parameter is on a boundary. *Econometrica* 67(6). | [doi:10.1111/1468-0262.00082](https://doi.org/10.1111/1468-0262.00082) |
-| 2 | Angelopoulos, Bates, Fisch, Lei, Schuster (2024). Conformal risk control. *ICLR*. | [arXiv:2208.02814](https://arxiv.org/abs/2208.02814) |
-| 3 | Angelopoulos, Bates, Candès, Jordan, Lei (2025). Learn then test. *Annals of Applied Statistics* 19(2). | [doi:10.1214/24-AOAS1998](https://doi.org/10.1214/24-AOAS1998), [arXiv:2110.01052](https://arxiv.org/abs/2110.01052) |
-| 4 | Bai, Jin (2026). Conformal selective prediction with general risk control. | [arXiv:2603.24704](https://arxiv.org/abs/2603.24704) |
-| 5 | Basel Committee on Banking Supervision (2006). International convergence of capital measurement and capital standards (Basel II). | [bis.org/publ/bcbs128](https://www.bis.org/publ/bcbs128.htm) |
-| 6 | Boyd, Vandenberghe (2004). *Convex Optimization*. | [stanford.edu/~boyd/cvxbook](https://web.stanford.edu/~boyd/cvxbook/) |
-| 7 | Charusaie, Samadi (2024). A unifying post-processing framework for multi-objective learn-to-defer problems. *NeurIPS*. | [arXiv:2407.12710](https://arxiv.org/abs/2407.12710) |
-| 8 | Chzhen, Denis, Hebiri, Oneto, Pontil (2019). Leveraging labeled and unlabeled data for consistent fair binary classification. *NeurIPS*. | [arXiv:1906.05082](https://arxiv.org/abs/1906.05082) |
-| 9 | Hjort, Pollard (1993). Asymptotics for minimisers of convex processes. | [arXiv:1107.3806](https://arxiv.org/abs/1107.3806) |
-| 10 | Joshi, Sun, Hassani, Dobriban (2025). MultiRisk. Multiple risk control via iterative score thresholding. | [arXiv:2512.24587](https://arxiv.org/abs/2512.24587) |
-| 11 | Lehmann, Romano (2005). *Testing Statistical Hypotheses*, third edition. | [doi:10.1007/0-387-27605-X](https://doi.org/10.1007/0-387-27605-X) |
-| 12 | Massart (1990). The tight constant in the Dvoretzky–Kiefer–Wolfowitz inequality. *Annals of Probability* 18(3). | [doi:10.1214/aop/1176990746](https://doi.org/10.1214/aop/1176990746) |
-| 13 | Sadinle, Lei, Wasserman (2019). Least ambiguous set-valued classifiers with bounded error levels. *JASA* 114(525). | [doi:10.1080/01621459.2017.1395341](https://doi.org/10.1080/01621459.2017.1395341), [arXiv:1609.00451](https://arxiv.org/abs/1609.00451) |
-| 14 | Self, Liang (1987). Asymptotic properties of maximum likelihood estimators and likelihood ratio tests under nonstandard conditions. *JASA* 82(398). | [doi:10.1080/01621459.1987.10478472](https://doi.org/10.1080/01621459.1987.10478472) |
-| 15 | Serrano-Cinca, Gutiérrez-Nieto (2016). The use of profit scoring as an alternative to credit scoring systems in P2P lending. *Decision Support Systems* 89. | [doi:10.1016/j.dss.2016.06.014](https://doi.org/10.1016/j.dss.2016.06.014) |
-| 16 | Shen, Su, Kong, Wu (2026). Conformal non-coverage risk control (CNCRC). *ICML 2026 Workshop*. | [icml.cc/virtual/2026/74503](https://icml.cc/virtual/2026/74503) |
-| 17 | Singh, Srikantha, Lakhanpal (2026). Cost-sensitive conformal prediction and human-in-the-loop abstention. | [arXiv:2607.27143](https://arxiv.org/abs/2607.27143) |
-| 18 | Tian, Feng (2025). Neyman–Pearson multi-class classification via cost-sensitive learning. *JASA* 120(550). | [arXiv:2111.04597](https://arxiv.org/abs/2111.04597) |
-| 19 | Tibshirani, Barber, Candès, Ramdas (2019). Conformal prediction under covariate shift. *NeurIPS*. | [arXiv:1904.06019](https://arxiv.org/abs/1904.06019) |
-| 20 | Vovk, Gammerman, Shafer (2005). *Algorithmic Learning in a Random World*. | [doi:10.1007/b106715](https://doi.org/10.1007/b106715) |
+| Figure 1 | `python src/simulation.py levels` | `fig_levels.png`, `fig_levels.csv` |
+| Figure 2 | `python src/simulation.py three --parts map` | `fig_three_map.png`, `three_map.csv` |
+| Table 1, Figure 6 | `python src/simulation.py three --parts cal --reps 100` | `three_cal_summary.csv`, `fig_three_splits.png` |
+| Figure 7 | `python src/simulation.py three --parts labels --reps 100` | `three_labels_summary.csv`, `fig_three_labels.png` |
+| Figure 3 | `python src/simulation.py errors --reps 100` | `fig_errors.png`, `errors_summary.csv` |
 
-## Author
+### LendingClub
 
-Sung In (David) Cho
+1. Download `accepted_2007_to_2018Q4.csv` from the [Kaggle LendingClub dataset](https://www.kaggle.com/datasets/wordsforthewise/lending-club) into `data/raw/`.
+2. Build the data and fit the models:
+
+```bash
+python src/prepare_lendingclub.py --raw data/raw/accepted_2007_to_2018Q4.csv
+python src/splits.py          # prints sizes, default rates and checks
+python src/train_models.py    # writes data/processed/pool_preds.parquet and hold_preds.parquet
+```
+
+3. Run the experiments. Outputs go to `results/lendingclub/`.
+
+| Paper | Command | Output |
+|---|---|---|
+| Figure 4, Table 2, Figure 8 | `python src/lendingclub.py table --n 100` | `fig_lc_levels.png`, `lc_table1.csv`, `fig_lc_splits.png` |
+| Figure 5 | `python src/lendingclub.py labels --n 50` | `fig_lc_labels.png`, `lc_labels.csv` |
+| Redraw figures | `python src/lendingclub.py figs` | from the saved csv files |
+| Check | `python src/lendingclub.py check` | plug-in prices against an exact LP solver |
+
+`table` takes about 10 minutes and `labels` about 5 minutes. Every LendingClub command takes `--main` (default `40`), the severity level in dollars per applicant used for Table 2.
+
+---
+
+## Main references
+
+- Angelopoulos, Bates, Fisch, Lei, Schuster (2024). *Conformal risk control.* ICLR.
+- Angelopoulos, Bates, Candès, Jordan, Lei (2025). *Learn then test: Calibrating predictive algorithms to achieve risk control.* Annals of Applied Statistics.
+- Lehmann and Romano (2005). *Testing Statistical Hypotheses*, Theorem 3.6.1.
+- Perdomo (2024). *The relative value of prediction in algorithmic decision making.* ICML.
+
+The full list is in the paper.
