@@ -1,25 +1,32 @@
 """
-LendingClub experiments of the writing sample (Section 6). Uses data/processed/val_preds.parquet and pool_preds.parquet,
-which prepare_lendingclub.py and train_models.py produce.
+LendingClub experiments of the working paper (Section 5.4 and Appendix D). Uses data/processed/pool_preds.parquet and
+hold_preds.parquet, which prepare_lendingclub.py and train_models.py produce (splits.py with the hold set).
+
+Design. In every split the 2015 loans are split at random into U (20%, new applicants, features only), cal (40%) and
+test (40%). The plug-in linear program on U (no outcomes) gives the weight theta_hat and its two prices, coverage and
+severity, for every level.
+  random split   : calibration on cal (2015, same period as the test loans)
+  temporal split : calibration on hold (2014 loans never used in training)
+Rules (all calibrated by multi-risk CRC on their own score):
+  dual      h = (theta_hat c_hat / B + 1 - theta_hat) p_hat, theta_hat from U, all calibration loans set the cut-off
+  lab       weight chosen on past labels: grid theta (step 0.05) on one half of the calibration loans, cut-off on the
+            other half
+  theta0    probability only, p_hat
+  theta1    expected loss only, p_hat c_hat
+  separate  coverage cut-off on p_hat and severity cut-off on p_hat c_hat, pass only below both
 
 Commands (repo root)                               output in results/lendingclub/
-  python src/lendingclub.py run --n 100            lc_levels.csv, lc_runs.csv, lc_summary.csv, lc_table60.csv,
-                                                   fig_lc_frontier.png (Figure 4), fig_lc_weight.png (Figure 3)
-  python src/lendingclub.py figs                   redraw Figures 3 and 4 from the saved csv files
-  python src/lendingclub.py shift --n 100          lc_shift_levels.csv, lc_shift_summary.csv, fig_lc_shift.png,
-                                                   diagnostics of the scores in 2015 (gap paragraph of Section 6)
-  python src/lendingclub.py delay --n 100          lc_delay_summary.csv, calibration on loans before 2015 (Discussion)
-  python src/lendingclub.py plugin --n 100         lc_plugin_summary.csv, plug-in cut-off without calibration (Section 6)
-  python src/lendingclub.py quintiles              default rate and loss per default by loan-amount fifth (Section 6)
-Run times: run and shift about 2 minutes each with --n 100.
-
-Rules compared (all meet both constraints)
-  ours      multi-risk CRC on h = (theta_hat c_hat / B + 1 - theta_hat) p_hat, theta_hat from validation loans, no labels
-  theta0    multi-risk CRC on p_hat
-  theta1    multi-risk CRC on p_hat c_hat
-  separate  coverage CRC on p_hat and severity CRC on p_hat c_hat, pass only below both (MultiRisk type)
-  cncrc     coverage CRC on p_hat and Pr(Y = 1, pass) <= alpha_sev / B by CRC on p_hat (worst-case cost B)
-Reference rows: cc_only (class-conditional CP) and sev_only (severity CRC). Hindsight: grid of theta, step 0.05.
+  python src/lendingclub.py table --n 100          lc_table1.csv, lc_table1_levels.csv, lc_table1_runs.csv,
+                                                   lc_gains.csv, fig_lc_levels.png, fig_lc_splits.png. Table 1 at the
+                                                   main level, positive prices and share accepted per level, risks of
+                                                   every split
+  python src/lendingclub.py figs                   redraw fig_lc_levels, fig_lc_splits and fig_lc_labels from the
+                                                   saved csv files
+  python src/lendingclub.py labels --n 50          lc_labels.csv, lc_labels_curve.csv, fig_lc_labels.png. Past
+                                                   outcomes m = 1,000 to the whole calibration part
+  Every command takes --main (default 40): the main level in $ for Table 1 and fig_lc_splits.
+  python src/lendingclub.py check                  plug-in weight and positive prices against linprog on 50,000 loans
+Run times: table about 10 minutes, labels about 5 minutes.
 """
 import argparse
 import time
@@ -28,24 +35,29 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.ticker
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import linprog
 
-from lc_data import B1, CAT_QUANTILE, C_HAT, split_pool
+from lc_data import B1, C_HAT, split_pool3
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "processed"
 RES = ROOT / "results" / "lendingclub"
 A_COV = 0.10
-LEVELS = sorted(set(np.round(np.exp(np.linspace(np.log(5), np.log(100), 20)), 4).tolist() + [60.0]))
-MAIN = 60.0
+GRID_LEVELS = np.round(np.exp(np.linspace(np.log(5), np.log(100), 20)), 4).tolist()
+MAIN = 40.0                                   # main level of Table 1 and fig_lc_splits; --main changes it
+LEVELS = sorted(set(GRID_LEVELS + [MAIN]))
 GRID = [round(t, 2) for t in np.arange(0, 1.0001, 0.05)]
-RULES = ["ours", "theta0", "theta1", "separate", "cncrc"]
-LABELS = {"ours": r"proposed, $\hat\theta$", "theta0": r"$\theta = 0$", "theta1": r"$\theta = 1$",
-          "separate": "separate cut-offs", "cncrc": "worst-case cost"}
-COLORS = {"ours": "#0b5cad", "theta0": "#7a7a7a", "theta1": "#c4661f", "separate": "#3a9a5b", "cncrc": "#8a5cb8"}
-INK, MUTED, GRIDC = "#1f2328", "#6e7781", "#d0d7de"
+RULES = ["dual", "lab", "theta0", "theta1", "separate"]
+LABELS = {"dual": r"plug-in dual weight $\hat\theta$", "lab": r"chosen on past labels $\hat\theta_{lab}$",
+          "theta0": r"probability only, $\theta = 0$", "theta1": r"expected loss only, $\theta = 1$",
+          "separate": "separate cut-offs"}
+SHORT = {"dual": "plug-in", "lab": "past labels", "theta0": "θ = 0", "theta1": "θ = 1", "separate": "separate"}
+COLORS = {"dual": "#0b5cad", "lab": "#8a5cb8", "theta0": "#7a7a7a", "theta1": "#c4661f", "separate": "#3a9a5b"}
+INK, MUTED, GRIDC, BAND = "#1f2328", "#6e7781", "#d0d7de", "#e8eef6"
+BUDGETS = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000]
 
 
 # ------------------------------------------------------------------ plug-in dual weight (no labels)
@@ -53,11 +65,11 @@ def dual_theta(p, c, a_cov, a_usd):
     """theta_hat and the multipliers from the plug-in linear program (no labels used)."""
     n = len(p)
     res = linprog(-np.ones(n), A_ub=np.vstack([p, p * c]), b_ub=[a_cov * p.sum(), n * a_usd],
-                  bounds=(0, 1), method="highs")
+                  bounds=(0, 1), method="highs-ipm")
     if res.status != 0:
         raise RuntimeError(res.message)
     lam = -res.ineqlin.marginals
-    if lam.sum() <= 0:                       # neither constraint binds: every case can pass, theta is irrelevant
+    if lam.sum() <= 0:                       # both prices zero: every case can pass, theta is irrelevant
         return 0.0, lam
     return float(lam[1] * B1 / (lam[0] + lam[1] * B1)), lam
 
@@ -100,189 +112,222 @@ def cut_sev(score, loss, alphas):
     return crc_cut(score, loss, alphas, B1)
 
 
-# ------------------------------------------------------------------ evaluation on the test half
-class Test:
-    def __init__(self, y, loss, tau):
-        self.y, self.loss, self.n = y, loss, len(y)
-        self.hl = (y == 1) & (loss >= tau)
-        self.nd, self.nhl = y.sum(), self.hl.sum()
+# ------------------------------------------------------------------ plug-in linear program on U (no labels)
+def plugin_prices(p, c, a_cov, levels):
+    """Which prices of the plug-in linear program are positive, for every level (no labels).
 
-    def from_mask(self, passed):
-        return dict(miss=(passed & (self.y == 1)).sum() / self.nd,
-                    harm=(passed * self.loss).sum() / self.n,
-                    hl=100 * (passed & self.hl).sum() / self.nhl,
-                    review=100 * (1 - passed.mean()))
-
-    def prefix(self, score):
-        """Fast evaluation of cut-offs on one score: returns a function t -> metrics."""
-        o = np.argsort(score, kind="stable")
-        s = score[o]
-        cd = np.concatenate([[0], np.cumsum(self.y[o])])
-        cl = np.concatenate([[0.0], np.cumsum(self.loss[o])])
-        ch = np.concatenate([[0], np.cumsum(self.hl[o])])
-
-        def ev(t):
-            m = np.searchsorted(s, t, side="left")
-            return dict(miss=cd[m] / self.nd, harm=cl[m] / self.n, hl=100 * ch[m] / self.nhl,
-                        review=100 * (1 - m / self.n))
-        return ev
+    With two constraints a price is positive exactly when the rule that ignores its constraint breaks it:
+      severity price > 0  <=>  the coverage-only rule (cut-off on p_hat) uses more than the severity level
+      coverage price > 0  <=>  the severity-only rule (cut-off on p_hat c_hat) uses more than the coverage level
+    (compare with the multipliers of linprog in the check command). Returns two boolean arrays (coverage, severity)."""
+    n = len(p)
+    pc = p * c
+    a1 = a_cov * p.sum() + 1e-12
+    a2 = n * np.asarray(levels, float) + 1e-9
+    o = np.argsort(p, kind="stable")
+    kc = int(np.searchsorted(np.cumsum(p[o]), a1, side="right"))
+    sev_of_cov_rule = pc[o][:kc].sum()
+    o = np.argsort(pc, kind="stable")
+    cs, cp_ = np.concatenate([[0.0], np.cumsum(pc[o])]), np.concatenate([[0.0], np.cumsum(p[o])])
+    ks = np.searchsorted(cs, a2, side="right") - 1                 # cases passed by the severity-only rule
+    return cp_[ks] > a1, sev_of_cov_rule > a2
 
 
-# ------------------------------------------------------------------ main
-def run(n_splits):
-    """Section 6. Levels, guarantees, frontier (Figure 4), Table 1 and the estimated weight (Figure 3)."""
+def plugin_theta(p, c, a_cov, levels, coarse=0.01, fine=0.001):
+    """theta_hat for every level from the plug-in linear program on unlabeled cases (no labels).
+
+    The linear program is solved through its threshold form: for each weight, pass the cases with the lowest
+    h_theta while both plug-in constraints hold, and keep the weight that passes the most. By linear-programming
+    duality this weight equals lambda_2 B / (lambda_1 + lambda_2 B) from the dual variables, up to the grid step
+    (compare with dual_theta in the check command). If the best weights include 0 or 1, that end is returned
+    (one constraint does not bind). Otherwise the centre of the best block on a grid of step `fine`.
+    About a hundred times faster than linprog on 50,000 cases for all levels at once."""
+    n = len(p)
+    pc = p * c
+    a1 = a_cov * p.sum() + 1e-12
+    a2 = n * np.asarray(levels, float) + 1e-9
+
+    def passed(ths):
+        out = np.empty((len(ths), len(a2)), int)
+        for i, th in enumerate(ths):
+            o = np.argsort(h(th, p, c), kind="stable")
+            kc = np.searchsorted(np.cumsum(p[o]), a1, side="right")
+            ks = np.searchsorted(np.cumsum(pc[o]), a2, side="right")
+            out[i] = np.minimum(kc, ks)
+        return out
+
+    grid = np.round(np.arange(0, 1 + coarse / 2, coarse), 6)
+    K = passed(grid)
+    theta = np.empty(len(a2))
+    for j in range(len(a2)):
+        best = np.flatnonzero(K[:, j] == K[:, j].max())
+        if best[0] == 0:
+            theta[j] = 0.0
+        elif best[-1] == len(grid) - 1:
+            theta[j] = 1.0
+        else:
+            lo, hi = max(0.0, grid[best[0]] - coarse), min(1.0, grid[best[-1]] + coarse)
+            g2 = np.round(np.arange(lo, hi + fine / 2, fine), 6)
+            k2 = passed(g2)[:, j]
+            b2 = g2[k2 == k2.max()]
+            theta[j] = float((b2[0] + b2[-1]) / 2)
+    return theta
+
+
+def labeled_theta(p, c, y, loss, alphas):
+    """Grid weight (step 0.05) that accepts the most of these labeled cases after calibrating on them, per level."""
+    share = np.empty((len(GRID), len(alphas)))
+    for i, th in enumerate(GRID):
+        s = h(th, p, c)
+        t = np.minimum(cut_cov(s, y, A_COV), cut_sev(s, loss, alphas))
+        share[i] = (s[:, None] < t[None, :]).mean(axis=0)
+    return np.array(GRID)[np.argmax(share, axis=0)]
+
+
+def metrics(passed, y, loss):
+    return dict(accept=100 * passed.mean(), miss=(passed & (y == 1)).sum() / y.sum(), harm=(passed * loss).sum() / len(y))
+
+
+def calibrated(score_cal, y, loss, alphas):
+    """Multi-risk CRC cut-off per level on one score."""
+    return np.minimum(cut_cov(score_cal, y, A_COV), cut_sev(score_cal, loss, alphas))
+
+
+def rules_on(cal, test, th_dual, alphas, rng):
+    """Cut-offs of the five rules from one calibration sample, evaluated on the test loans. Returns rows per level."""
+    p1, c1, y1, l1 = cal
+    p2, c2, y2, l2 = test
+    rows = []
+    # plug-in dual weight: one weight per level, all calibration loans
+    for j, th in enumerate(th_dual):
+        s1 = h(th, p1, c1)
+        t = min(cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas[j]))
+        rows.append(("dual", j, th, metrics(h(th, p2, c2) < t, y2, l2)))
+    # weight chosen on past labels: half A picks theta, half B calibrates
+    perm = rng.permutation(len(p1))
+    A, Bh = perm[: len(p1) // 2], perm[len(p1) // 2:]
+    th_lab = labeled_theta(p1[A], c1[A], y1[A], l1[A], alphas)
+    for j, th in enumerate(th_lab):
+        s1 = h(th, p1[Bh], c1[Bh])
+        t = min(cut_cov(s1, y1[Bh], A_COV), cut_sev(s1, l1[Bh], alphas[j]))
+        rows.append(("lab", j, th, metrics(h(th, p2, c2) < t, y2, l2)))
+    # theta = 0 and theta = 1
+    for rule, th in [("theta0", 0.0), ("theta1", 1.0)]:
+        s1, s2 = h(th, p1, c1), h(th, p2, c2)
+        t = calibrated(s1, y1, l1, alphas)
+        for j in range(len(alphas)):
+            rows.append((rule, j, th, metrics(s2 < t[j], y2, l2)))
+    # separate cut-offs: coverage on p_hat, severity on p_hat c_hat, accept only below both
+    tc = cut_cov(p1, y1, A_COV)
+    ts = cut_sev(p1 * c1, l1, alphas)
+    for j in range(len(alphas)):
+        rows.append(("separate", j, np.nan, metrics((p2 < tc) & (p2 * c2 < ts[j]), y2, l2)))
+    return rows
+
+
+def summarize_new(runs, keys, n_splits):
+    """Means over splits, Monte Carlo SE, share of each level used, and the share of splits above each level."""
+    runs = runs.assign(exc_cov=runs.miss > A_COV, exc_sev=runs.harm > runs.alpha_sev)
+    g = runs.groupby(keys)
+    s = g[["accept", "miss", "harm", "theta"]].mean()
+    s = s.join((g[["accept", "miss", "harm"]].std() / np.sqrt(n_splits)).add_prefix("se_"))
+    s = s.join(100 * g[["exc_cov", "exc_sev"]].mean()).reset_index()
+    s["freq_used"] = 100 * s.miss / A_COV
+    s["loss_used"] = 100 * s.harm / s.alpha_sev
+    s["z_cov"] = (s.miss - A_COV) / s.se_miss.clip(lower=1e-12)
+    s["z_sev"] = (s.harm - s.alpha_sev) / s.se_harm.clip(lower=1e-12)
+    return s
+
+
+def gains(summ, runs):
+    """Per setting and level: share of splits with two positive prices, and the gain in share passed of the plug-in
+    dual weight over the better single score (theta = 0 or 1, better in mean), over separate cut-offs and over the
+    weight chosen on past labels (pp)."""
+    two = runs[runs.rule == "dual"].groupby(["setting", "alpha_sev"]).n_pos.apply(lambda v: (v == 2).mean())
+    acc = summ.pivot_table(index=["setting", "alpha_sev"], columns="rule", values="accept")
+    out = pd.DataFrame({"share_two_pos": two,
+                        "accept_dual": acc["dual"],
+                        "gain_vs_single": acc["dual"] - np.maximum(acc["theta0"], acc["theta1"]),
+                        "gain_vs_separate": acc["dual"] - acc["separate"],
+                        "gain_vs_lab": acc["dual"] - acc["lab"]})
+    return out.reset_index()
+
+
+def table(n_splits):
+    """Table 1 at the main level, positive prices and gains per level, risks of every split. Random and temporal split."""
     t0 = time.time()
     RES.mkdir(parents=True, exist_ok=True)
-    val, pv, cv, yv, lv = load("val_preds.parquet")
-    pool, pp, cp, yp, lp = load("pool_preds.parquet")
-    tau = np.quantile(lv[yv == 1], CAT_QUANTILE)                    # high-loss threshold, validation labels
+    _, pp, cp, yp, lp = load("pool_preds.parquet")
+    _, ph, ch, yh, lh = load("hold_preds.parquet")
     alphas = np.array(LEVELS)
+    print(f"2015 loans {len(pp):,} (U 20%, cal 40%, test 40%), hold loans {len(ph):,}", flush=True)
 
-    # ---- R4 inputs: theta_hat per level, unlabeled validation loans --------------------------------------------
-    rows = []
-    for a in LEVELS:
-        th, lam = dual_theta(pv, cv, A_COV, a)
-        l1, l2 = float(lam[0]), float(lam[1])
-        kappa = l1 / l2 if l2 > 1e-12 else np.inf                 # = B (1 - theta) / theta, dollars per default
-        binds = ("both" if l1 > 1e-9 and l2 > 1e-9 else "coverage" if l1 > 1e-9 else
-                 "severity" if l2 > 1e-9 else "none")
-        rows.append(dict(alpha_sev=a, theta_hat=th, lambda_cov=l1, lambda_sev=l2, kappa=kappa, binds=binds))
-    lev = pd.DataFrame(rows)
-    lev.to_csv(RES / "lc_levels.csv", index=False)
-
-    # class-conditional CP on validation halves (labels used, for the sentence on the range of levels)
-    rng = np.random.default_rng(2026)
-    s_cc = []
-    for _ in range(20):
-        perm = rng.permutation(len(pv))
-        a_, b_ = perm[: len(pv) // 2], perm[len(pv) // 2:]
-        t = cut_cov(pv[a_], yv[a_], A_COV)
-        s_cc.append(((pv[b_] < t) * lv[b_]).sum() / len(b_))
-    s_cc = float(np.mean(s_cc))
-    print(f"Validation: {len(pv):,} loans. High-loss default: loss >= ${tau:,.0f}. "
-          f"Class-conditional CP leaves ${s_cc:.1f} per applicant uncovered.")
-    print(lev.round(4).to_string(index=False))
-    print(f"[{time.time() - t0:.0f}s]\n", flush=True)
-
-    # ---- splits ------------------------------------------------------------------------------------------------
     recs = []
     for seed in range(n_splits):
-        ci, ti = split_pool(len(pool), seed=seed)
-        p1, c1, y1, l1 = pp[ci], cp[ci], yp[ci], lp[ci]
-        p2, c2, y2, l2 = pp[ti], cp[ti], yp[ti], lp[ti]
-        T = Test(y2, l2, tau)
-
-        def add(rule, j, m, theta=np.nan):
-            recs.append(dict(seed=seed, alpha_sev=LEVELS[j], rule=rule, theta=theta, **m))
-
-        # theta0, cncrc, cc_only : score p_hat
-        ev = T.prefix(p2)
-        tc = cut_cov(p1, y1, A_COV)
-        ts = cut_sev(p1, l1, alphas)
-        tw = crc_cut(p1, (y1 == 1).astype(float), alphas / B1, 1.0)   # Pr(Y = 1, pass) <= alpha_sev / B
-        m_cc = ev(tc)
-        for j in range(len(LEVELS)):
-            add("theta0", j, ev(min(tc, ts[j])))
-            add("cncrc", j, ev(min(tc, tw[j])))
-            add("cc_only", j, m_cc)
-
-        # theta1, sev_only : score p_hat c_hat
-        ev = T.prefix(p2 * c2)
-        tc1 = cut_cov(p1 * c1, y1, A_COV)
-        ts1 = cut_sev(p1 * c1, l1, alphas)
-        for j in range(len(LEVELS)):
-            add("theta1", j, ev(min(tc1, ts1[j])))
-            add("sev_only", j, ev(ts1[j]))
-
-        # separate cut-offs: p_hat < t_cov (on p_hat) and p_hat c_hat < t_sev (on p_hat c_hat)
-        for j in range(len(LEVELS)):
-            add("separate", j, T.from_mask((p2 < tc) & (p2 * c2 < ts1[j])))
-
-        # ours: theta_hat differs by level
-        for j, th in enumerate(lev.theta_hat):
-            s1, s2 = h(th, p1, c1), h(th, p2, c2)
-            t = min(cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas[j]))
-            add("ours", j, T.from_mask(s2 < t), th)
-
-        # hindsight grid
-        for th in GRID:
-            s1, s2 = h(th, p1, c1), h(th, p2, c2)
-            ev = T.prefix(s2)
-            tcg, tsg = cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas)
-            for j in range(len(LEVELS)):
-                add("grid", j, ev(min(tcg, tsg[j])), th)
-
+        rng = np.random.default_rng(20_000 + seed)
+        U, C, T = split_pool3(len(pp), seed)
+        th_dual = plugin_theta(pp[U], cp[U], A_COV, alphas)
+        pos_cov, pos_sev = plugin_prices(pp[U], cp[U], A_COV, alphas)
+        n_pos = pos_cov.astype(int) + pos_sev.astype(int)
+        test = (pp[T], cp[T], yp[T], lp[T])
+        for setting, cal in [("random", (pp[C], cp[C], yp[C], lp[C])), ("temporal", (ph, ch, yh, lh))]:
+            for rule, j, th, m in rules_on(cal, test, th_dual, alphas, rng):
+                recs.append(dict(seed=seed, setting=setting, rule=rule, alpha_sev=LEVELS[j], theta=th,
+                                 n_pos=n_pos[j], pos_cov=pos_cov[j], pos_sev=pos_sev[j], **m))
         if (seed + 1) % 10 == 0 or seed == 0:
             print(f"  {seed + 1}/{n_splits} splits  [{time.time() - t0:.0f}s]", flush=True)
 
     runs = pd.DataFrame(recs)
-    runs.to_csv(RES / "lc_runs.csv", index=False)
-    summ = summarize(runs, n_splits)
-    summ.to_csv(RES / "lc_summary.csv", index=False)
-    report(summ, lev)
-    figures(summ, lev)
-    print(f"\nSaved to {RES}  [{time.time() - t0:.0f}s]")
+    runs.to_csv(RES / "lc_table1_runs.csv", index=False)
+    summ = summarize_new(runs, ["setting", "rule", "alpha_sev"], n_splits)
+    summ.to_csv(RES / "lc_table1_levels.csv", index=False)
+    main = summ[np.isclose(summ.alpha_sev, MAIN)]
+    tab = main.pivot(index="rule", columns="setting", values=["accept", "freq_used", "loss_used"]).loc[RULES]
+    tab = tab.reorder_levels([1, 0], axis=1).sort_index(axis=1, level=0)[
+        [(s, v) for s in ("random", "temporal") for v in ("accept", "freq_used", "loss_used")]]
+    tab.to_csv(RES / "lc_table1.csv")
 
-
-def summarize(runs, n_splits):
-    g = runs.groupby(["alpha_sev", "rule", "theta"], dropna=False)
-    s = g[["miss", "harm", "hl", "review"]].mean()
-    se = g[["miss", "harm", "hl", "review"]].std() / np.sqrt(n_splits)
-    s = s.join(se.add_prefix("se_")).reset_index()
-    s["cov_used"] = 100 * s.miss / A_COV
-    s["sev_used"] = 100 * s.harm / s.alpha_sev
-    return s
-
-
-def hindsight(summ):
-    gr = summ[summ.rule == "grid"]
-    return gr.loc[gr.groupby("alpha_sev").review.idxmin()].set_index("alpha_sev")
-
-
-def report(summ, lev):
     pd.set_option("display.width", 220, "display.max_rows", 500)
-    main_rows = summ[summ.rule.isin(RULES)]
+    print(f"\nTable 1 at alpha_cov = {A_COV}, alpha_sev = ${MAIN:g} (means over {n_splits} splits; "
+          f"used = risk / level x 100):")
+    print(tab.rename(index=SHORT).round(1).to_string())
+    print(f"Largest SE of the share accepted at ${MAIN:g}: {main.se_accept.max():.2f} pp")
+    print(f"\nWeights at ${MAIN:g} (mean over splits): " + ", ".join(
+        f"{s} {r} {main[(main.setting == s) & (main.rule == r)].theta.iloc[0]:.3f}"
+        for s in ("random", "temporal") for r in ("dual", "lab")))
 
-    # R1
-    m = summ[np.isclose(summ.alpha_sev, MAIN)]
-    cc, so = m[m.rule == "cc_only"].iloc[0], m[m.rule == "sev_only"].iloc[0]
-    print(f"\nR1 at $60: class-conditional CP leaves ${cc.harm:.1f} per applicant uncovered "
-          f"and {100 * cc.miss:.1f}% of defaults (review {cc.review:.2f}%). Severity-only CRC leaves "
-          f"{100 * so.miss:.1f}% of defaults and ${so.harm:.1f} per applicant uncovered (review {so.review:.2f}%).")
+    # positive prices of the plug-in linear program on U, per level
+    pr = runs[(runs.rule == "dual") & (runs.setting == "random")].groupby("alpha_sev")
+    pos = pd.DataFrame({"two positive (%)": 100 * pr.n_pos.apply(lambda v: (v == 2).mean()),
+                        "coverage only (%)": 100 * pr.apply(lambda d: (d.pos_cov & ~d.pos_sev).mean()),
+                        "severity only (%)": 100 * pr.apply(lambda d: (~d.pos_cov & d.pos_sev).mean()),
+                        "theta_hat": pr.theta.mean()})
+    print("\nPositive prices of the plug-in linear program on U, share of splits per level:")
+    print(pos.round(1).to_string())
 
-    # R2
-    z_cov = ((main_rows.miss - A_COV) / main_rows.se_miss.clip(lower=1e-12)).max()
-    z_sev = ((main_rows.harm - main_rows.alpha_sev) / main_rows.se_harm.clip(lower=1e-12)).max()
-    print(f"\nR2 guarantees, {len(LEVELS)} levels x {len(RULES)} rules: largest excess over the level in Monte Carlo SE, "
-          f"coverage {z_cov:.2f}, severity {z_sev:.2f} (below 2 means no violation detected).")
-    print(f"   uncovered defaults range {main_rows.miss.min():.4f} to {main_rows.miss.max():.4f}; "
-          f"severity used at most {main_rows.sev_used.max():.1f}%")
+    gn = gains(summ, runs)
+    gn.to_csv(RES / "lc_gains.csv", index=False)
+    print("\nGain of the plug-in dual weight in share accepted (pp), per level:")
+    print(gn.pivot(index="alpha_sev", columns="setting",
+                   values=["share_two_pos", "gain_vs_single", "gain_vs_separate", "gain_vs_lab"]).round(2).to_string())
+    print("\nMean gain over the better single score, by levels with two positive prices in most splits or not:")
+    print(gn.assign(two=gn.share_two_pos > 0.5).groupby(["setting", "two"])[
+        ["gain_vs_single", "gain_vs_separate", "gain_vs_lab"]].agg(["mean", "min", "max"]).round(2).to_string())
 
-    # R3 (2): table at $60
-    tab = m[m.rule.isin(RULES)].set_index("rule").loc[RULES,
-          ["miss", "harm", "hl", "review", "cov_used", "sev_used", "se_review", "se_harm", "se_hl"]]
-    tab.to_csv(RES / "lc_table60.csv")
-    print("\nR3(2) Table 1 at alpha_cov = 0.10, alpha_sev = $60 (means over splits):")
-    print(tab.round(4).to_string())
+    print("\nGuarantees over all levels. exceeded = mean above the level by more than 2 standard errors; "
+          "split share = % of splits above the level (largest over levels, and at the main level):")
+    agg = summ.groupby(["setting", "rule"]).agg(
+        levels_cov_exceeded=("z_cov", lambda z: int((z > 2).sum())),
+        levels_sev_exceeded=("z_sev", lambda z: int((z > 2).sum())),
+        max_freq_used=("freq_used", "max"), max_loss_used=("loss_used", "max"),
+        max_split_share_cov=("exc_cov", "max"), max_split_share_sev=("exc_sev", "max"))
+    at60 = main.set_index(["setting", "rule"])[["exc_cov", "exc_sev"]].add_prefix("split_share_main_")
+    print(agg.join(at60).round(1).to_string())
+    print("(CRC bounds the mean risk over splits; single splits above the level are expected in the random split)")
 
-    # R3 (1): review per level and rule
-    wide = main_rows.pivot_table(index="alpha_sev", columns="rule", values="review").loc[:, RULES]
-    best = hindsight(summ)
-    wide["hindsight"] = best.review
-    print("\nR3(1) share sent to review (%) per level:")
-    print(wide.round(2).to_string())
-    for r in RULES[1:]:
-        d = wide[r] - wide["ours"]
-        print(f"   {r:>9s} minus ours: mean {d.mean():+.2f} pp, min {d.min():+.2f}, max {d.max():+.2f}")
-
-    # R4
-    out = lev.set_index("alpha_sev")[["theta_hat", "kappa", "binds"]].copy()
-    out["theta_hindsight"] = best.theta
-    out["review_ours"] = wide["ours"]
-    out["review_hindsight"] = best.review
-    out["gap_pp"] = out.review_ours - out.review_hindsight
-    print("\nR4 estimated weight (kappa in $ per default, inf where severity does not bind):")
-    print(out.round(3).to_string())
+    figures(summ, runs)
+    print(f"\nSaved lc_table1.csv, lc_table1_levels.csv, lc_table1_runs.csv, lc_gains.csv, fig_lc_levels.png and "
+          f"fig_lc_splits.png to {RES}  [{time.time() - t0:.0f}s]")
 
 
 def style(ax):
@@ -292,360 +337,174 @@ def style(ax):
     ax.tick_params(colors=INK, labelsize=8)
 
 
-def figures(summ, lev):
-    # frontier: review against protection, one curve per rule across levels
-    fig, axes = plt.subplots(1, 2, figsize=(6.5, 2.9), sharey=True)   # printed at the full text width
+def figures(summ, runs):
+    """fig_lc_levels: random split, share accepted by each rule against the level, with the levels where both
+    plug-in prices are positive in most splits shaded. fig_lc_splits: risk of every split at the main level."""
+    two = runs[(runs.rule == "dual") & (runs.setting == "random")].groupby("alpha_sev").n_pos.apply(
+        lambda v: (v == 2).mean())
+    two = two.index[two > 0.5]
+    acc = summ[summ.setting == "random"].pivot(index="alpha_sev", columns="rule", values="accept")
+    fig, ax = plt.subplots(figsize=(4.6, 3.0))
+    if len(two):
+        ax.axvspan(two.min(), two.max(), color=BAND, lw=0, zorder=0, label="both prices positive")
     for r in RULES:
-        s = summ[summ.rule == r].sort_values("alpha_sev")
-        # ours is drawn thick underneath, so that theta = 1 (dashed) stays visible where the two coincide
-        kw = dict(color=COLORS[r], marker="o", ms=2.2 if r != "ours" else 3.5, lw=0.9 if r != "ours" else 2.0,
-                  ls="--" if r == "theta1" else "-", label=LABELS[r], zorder=2 if r == "ours" else 3)
-        axes[0].plot(s.harm, s.review, **kw)
-        axes[1].plot(s.hl, s.review, **kw)
-    # panel letters go below each plot, under the axis label
-    axes[0].set_xlabel("uncovered loss per applicant (\\$)\n(a)", fontsize=9, color=INK, linespacing=1.8)
-    axes[1].set_xlabel("high-loss defaults left uncovered (%)\n(b)", fontsize=9, color=INK, linespacing=1.8)
-    axes[0].set_ylabel("sent to review (%)", fontsize=9, color=INK)
-    for ax in axes:
-        style(ax)
-    axes[0].legend(fontsize=7.5, frameon=False)
+        ax.plot(acc.index, acc[r], color=COLORS[r], marker="o", ms=2.5, lw=1.8 if r == "dual" else 1.1,
+                zorder=3 if r == "dual" else 2, label=LABELS[r])
+    ax.set_xscale("log")
+    ax.set_xticks([5, 10, 20, 50, 100])
+    ax.set_xticklabels(["5", "10", "20", "50", "100"])
+    ax.minorticks_off()
+    ax.set_xlabel(r"severity level $\alpha_{\mathrm{sev}}$ (\$ per applicant)", fontsize=8.5, color=INK)
+    ax.set_ylabel("share accepted (%)", fontsize=8.5, color=INK)
+    style(ax)
+    ax.legend(fontsize=6.5, frameon=False, loc="upper left")
     fig.tight_layout()
-    fig.savefig(RES / "fig_lc_frontier.png", dpi=300)
+    fig.savefig(RES / "fig_lc_levels.png", dpi=300)
 
-    # estimated weight and its cost in reviews, against the level
-    best = hindsight(summ)
-    l = lev.sort_values("alpha_sev")
-    ours = summ[summ.rule == "ours"].set_index("alpha_sev").review
-    weight_figure(RES / "fig_lc_weight.png", best,
-                  [(r"$\hat\theta$", COLORS["ours"], l.alpha_sev.to_numpy(), l.theta_hat.to_numpy(),
-                    (ours - best.review).loc[l.alpha_sev].to_numpy())])
-
-
-def weight_figure(path, best, series):
-    """(a) weights against the level, with the best grid weight on the test loans.
-    (b) share sent to review with the estimated weight minus that with the best grid weight (pp).
-    series: list of (label, color, levels, weights, gaps)."""
-    fig, axes = plt.subplots(1, 2, figsize=(6.5, 2.7))   # printed at the full text width
-    ax = axes[0]
-    for lab, col, x, th, _ in series:
-        ax.plot(x, th, color=col, marker="o", ms=3, lw=1.2, label=lab)
-    # hollow black squares, so that orange keeps meaning theta = 1 as in the frontier figure
-    ax.plot(best.index, best.theta, color=INK, marker="s", ms=3.2, mfc="none", mew=0.9, lw=0,
-            label="best on the test loans")
-    ax.set_ylabel(r"weight $\theta$", fontsize=9, color=INK)
-    ax.set_ylim(-0.05, 1.05)
-    ax.legend(fontsize=7.5, frameon=False, loc="lower left")
-    ax = axes[1]
-    for lab, col, x, _, gap in series:
-        ax.plot(x, gap, color=col, marker="o", ms=3, lw=1.2, label=lab)
-    ax.axhline(0, color=MUTED, lw=0.8)
-    ax.set_ylabel("extra share sent to review (pp)", fontsize=9, color=INK)
-    if len(series) > 1:
-        ax.legend(fontsize=7.5, frameon=False, loc="upper left")
-    for ax, letter in zip(axes, "ab"):
-        ax.set_xscale("log")
-        ax.set_xticks([5, 10, 20, 50, 100])
-        ax.set_xticklabels(["5", "10", "20", "50", "100"])
-        ax.minorticks_off()
-        ax.set_xlabel(r"severity level $\alpha_{\mathrm{sev}}$ (\$ per applicant)" + f"\n({letter})",
-                      fontsize=9, color=INK, linespacing=1.8)
-        style(ax)
+    # risk of every split at the main level. Boxes: quartiles; whiskers: 5th and 95th percentiles; dot: mean
+    d = runs[np.isclose(runs.alpha_sev, MAIN)]
+    fig, axes = plt.subplots(2, 2, figsize=(6.5, 4.4), sharex=True, sharey="row")
+    for col, setting in enumerate(("random", "temporal")):
+        for row, (v, lab) in enumerate([("freq", "coverage used (%)"), ("loss", "severity used (%)")]):
+            ax = axes[row, col]
+            x = d[d.setting == setting]
+            vals = [100 * (x[x.rule == r].miss / A_COV if v == "freq" else x[x.rule == r].harm / MAIN) for r in RULES]
+            bp = ax.boxplot(vals, widths=0.6, patch_artist=True, showfliers=False, whis=(5, 95), showmeans=True,
+                            meanprops=dict(marker="o", markersize=3.5, markerfacecolor=INK, markeredgecolor=INK))
+            for patch, r in zip(bp["boxes"], RULES):
+                patch.set_facecolor(COLORS[r])
+                patch.set_alpha(0.35)
+            for med in bp["medians"]:
+                med.set_color(INK)
+            ax.axhline(100, color=MUTED, lw=0.8, ls="--")
+            if col == 0:
+                ax.set_ylabel(lab, fontsize=8.5, color=INK)
+            if row == 0:
+                ax.set_title(f"{setting} split", fontsize=8.5, color=INK)
+            style(ax)
+            ax.grid(False)
+        axes[1, col].set_xticks(range(1, len(RULES) + 1))
+        axes[1, col].set_xticklabels([SHORT[r] for r in RULES], rotation=30, ha="right", fontsize=7.5)
     fig.tight_layout()
-    fig.savefig(path, dpi=300)
+    fig.savefig(RES / "fig_lc_splits.png", dpi=300)
 
 
+def labels_figure(out):
+    """fig_lc_labels from lc_labels.csv: share accepted at the main level against the number of labeled loans m.
+    Shaded: m < 2 B / alpha_sev, where the m/2 loans left for calibration are too few for the severity cut-off to
+    pass anyone (CRC needs (sum of losses + B) / (n + 1) <= alpha_sev, so n + 1 > B / alpha_sev)."""
+    fig, ax = plt.subplots(figsize=(4.6, 3.0))
+    lim = 2 * B1 / MAIN
+    if out.index.min() < lim:
+        ax.axvspan(out.index.min() / 1.15, lim, color="#eeeeee", lw=0, zorder=0)
+        ax.text(np.sqrt(out.index.min() / 1.15 * lim), out[["dual_main", "lab_main"]].to_numpy().max() * 0.97,
+                "half the m\ntoo few to\ncalibrate", ha="center", va="top", fontsize=6.5, color=MUTED,
+                bbox=dict(facecolor="#eeeeee", edgecolor="none", pad=1))
+    for col, rule, lab in [("dual_main", "dual", "plug-in prices: all m loans calibrate"),
+                           ("lab_main", "lab", "weight chosen on m/2 loans, m/2 calibrate")]:
+        ax.plot(out.index, out[col], color=COLORS[rule], marker="o", ms=3, lw=1.4, label=lab, zorder=3)
+    ax.set_xscale("log")
+    ax.set_xlim(out.index.min() / 1.15, out.index.max() * 1.15)
+    ax.set_xlabel("labeled loans m", fontsize=8.5, color=INK)
+    ax.set_ylabel(f"share accepted at ${MAIN:g} (%)", fontsize=8.5, color=INK)
+    style(ax)
+    ax.legend(fontsize=7, frameon=False, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(RES / "fig_lc_labels.png", dpi=300)
 
-# ------------------------------------------------------------------ shift between periods
-C2015 = "#3a9a5b"
 
-
-def s_cc_plugin(p, c):
-    """Uncovered severity of the cut-off on p_hat at level alpha_cov, computed from p_hat and c_hat only."""
-    o = np.argsort(p, kind="stable")
-    k = int(np.searchsorted(np.cumsum(p[o]), A_COV * p.sum(), side="right"))
-    return float((p[o][:k] * c[o][:k]).sum() / len(p))
-
-
-def s_cc_actual(p, y, loss, rng, reps=20):
-    """Uncovered loss per applicant of class-conditional CP, calibrated on one half and evaluated on the other."""
-    out = []
-    for _ in range(reps):
-        perm = rng.permutation(len(p))
-        a, b = perm[: len(p) // 2], perm[len(p) // 2:]
-        t = cut_cov(p[a], y[a], A_COV)
-        out.append(((p[b] < t) * loss[b]).sum() / len(b))
-    return float(np.mean(out))
-
-
-def shift(n_splits):
-    """Section 6, gap to the hindsight weight. Weight from 2015 loans without outcomes, and score diagnostics."""
+def labels(n_splits):
+    """Appendix table. Random split. m past outcomes drawn from cal: plug-in dual weight (all m calibrate) against the
+    weight chosen on the labels (m/2 choose, m/2 calibrate). Printed at the main level and averaged over the levels where both
+    plug-in prices are positive in most splits."""
     t0 = time.time()
     RES.mkdir(parents=True, exist_ok=True)
-    _, pv, cv, yv, lv = load("val_preds.parquet")
     _, pp, cp, yp, lp = load("pool_preds.parquet")
-    tau = np.quantile(lv[yv == 1], CAT_QUANTILE)
     alphas = np.array(LEVELS)
 
-    rng = np.random.default_rng(2027)
-    perm = rng.permutation(len(pp))
-    u, r = perm[: len(pp) // 3], perm[len(pp) // 3:]
-    pu, cu = pp[u], cp[u]                                   # unlabeled 2015 sample: scores only
-    pr, cr, yr, lr = pp[r], cp[r], yp[r], lp[r]
-
-    # ---- diagnostics (labels used for printing only) ------------------------------------------------------------
-    rows = []
-    for name, p, c, y, loss in [("validation (pre-2015)", pv, cv, yv, lv), ("2015 unlabeled U", pu, cu, yp[u], lp[u]),
-                                ("2015 cal/test pool", pr, cr, yr, lr)]:
-        rows.append({"sample": name, "loans": len(p), "mean p_hat": p.mean(), "default rate": y.mean(),
-                     "mean p_hat c_hat ($)": (p * c).mean(), "loss per applicant ($)": loss.mean(),
-                     "S_cc plug-in ($)": s_cc_plugin(p, c), "S_cc actual ($)": s_cc_actual(p, y, loss, rng)})
-    diag = pd.DataFrame(rows)
-    pd.set_option("display.width", 220)
-    print("Diagnostics (outcomes used only here):")
-    print(diag.round(4).to_string(index=False))
-
-    # ---- the two estimates of the weight -----------------------------------------------------------------------
-    lev = []
-    for a in LEVELS:
-        tv, lamv = dual_theta(pv, cv, A_COV, a)
-        tu, lamu = dual_theta(pu, cu, A_COV, a)
-        lev.append(dict(alpha_sev=a, theta_val=tv, theta_2015=tu,
-                        kappa_val=lamv[0] / lamv[1] if lamv[1] > 1e-12 else np.inf,
-                        kappa_2015=lamu[0] / lamu[1] if lamu[1] > 1e-12 else np.inf))
-    lev = pd.DataFrame(lev)
-    lev.to_csv(RES / "lc_shift_levels.csv", index=False)
-    print("\nWeights (no labels used):")
-    print(lev.round(4).to_string(index=False))
-    print(f"[{time.time() - t0:.0f}s]\n", flush=True)
-
-    # ---- splits ------------------------------------------------------------------------------------------------
     recs = []
     for seed in range(n_splits):
-        ci, ti = split_pool(len(pr), seed=seed)
-        p1, c1, y1, l1 = pr[ci], cr[ci], yr[ci], lr[ci]
-        p2, c2 = pr[ti], cr[ti]
-        T = Test(yr[ti], lr[ti], tau)
-
-        for j, row in lev.iterrows():
-            for rule, th in [("theta_val", row.theta_val), ("theta_2015", row.theta_2015)]:
-                s1, s2 = h(th, p1, c1), h(th, p2, c2)
-                t = min(cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas[j]))
-                recs.append(dict(seed=seed, alpha_sev=LEVELS[j], rule=rule, theta=th, **T.from_mask(s2 < t)))
-        for th in GRID:
-            s1, s2 = h(th, p1, c1), h(th, p2, c2)
-            ev = T.prefix(s2)
-            tc, ts = cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas)
-            for j in range(len(LEVELS)):
-                recs.append(dict(seed=seed, alpha_sev=LEVELS[j], rule="grid", theta=th, **ev(min(tc, ts[j]))))
+        rng = np.random.default_rng(30_000 + seed)
+        U, C, T = split_pool3(len(pp), seed)
+        th_dual = plugin_theta(pp[U], cp[U], A_COV, alphas)
+        pos_cov, pos_sev = plugin_prices(pp[U], cp[U], A_COV, alphas)
+        p2, c2, y2, l2 = pp[T], cp[T], yp[T], lp[T]
+        order = rng.permutation(C)
+        for m in [b for b in BUDGETS if b < len(C)] + [len(C)]:
+            L = order[:m]
+            A, Bh = L[: m // 2], L[m // 2:]
+            th_lab = labeled_theta(pp[A], cp[A], yp[A], lp[A], alphas)
+            for j, a in enumerate(alphas):
+                for rule, th, cal in [("dual", th_dual[j], L), ("lab", th_lab[j], Bh)]:
+                    s1 = h(th, pp[cal], cp[cal])
+                    t = min(cut_cov(s1, yp[cal], A_COV), cut_sev(s1, lp[cal], a))
+                    recs.append(dict(seed=seed, m=m, rule=rule, alpha_sev=LEVELS[j], theta=th,
+                                     both=bool(pos_cov[j] and pos_sev[j]), **metrics(h(th, p2, c2) < t, y2, l2)))
         if (seed + 1) % 10 == 0 or seed == 0:
             print(f"  {seed + 1}/{n_splits} splits  [{time.time() - t0:.0f}s]", flush=True)
 
     runs = pd.DataFrame(recs)
-    g = runs.groupby(["alpha_sev", "rule", "theta"])
-    summ = g[["miss", "harm", "hl", "review"]].mean()
-    summ = summ.join((g[["miss", "harm"]].std() / np.sqrt(n_splits)).add_prefix("se_")).reset_index()
-    summ.to_csv(RES / "lc_shift_summary.csv", index=False)
-
-    gr = summ[summ.rule == "grid"]
-    best = gr.loc[gr.groupby("alpha_sev").review.idxmin()].set_index("alpha_sev")
-    rv = summ[summ.rule == "theta_val"].set_index("alpha_sev")
-    ru = summ[summ.rule == "theta_2015"].set_index("alpha_sev")
-    out = pd.DataFrame({"theta_val": rv.theta, "theta_2015": ru.theta, "theta_best": best.theta,
-                        "review_val": rv.review, "review_2015": ru.review, "review_best": best.review})
-    out["gap_val"] = out.review_val - out.review_best
-    out["gap_2015"] = out.review_2015 - out.review_best
-    print("\nReview (%) and gap to the best grid weight on the test halves (pp):")
-    print(out.round(3).to_string())
-    mid = out.index[out.theta_best < 1]                      # levels where the best weight is not the end theta = 1
-    print(f"\nLevels where the best weight is below 1 ({len(mid)}): mean gap, validation weight "
-          f"{out.gap_val[mid].mean():.2f} pp, 2015 unlabeled weight {out.gap_2015[mid].mean():.2f} pp")
-
-    z_cov = ((ru.miss - A_COV) / ru.se_miss.clip(lower=1e-12)).max()
-    z_sev = ((ru.harm - ru.index) / ru.se_harm.clip(lower=1e-12)).max()
-    print(f"Guarantees with the 2015 weight: largest excess in Monte Carlo SE, coverage {z_cov:.2f}, severity {z_sev:.2f}")
-
-    x = out.index.to_numpy()
-    weight_figure(RES / "fig_lc_shift.png", best,
-                  [(r"$\hat\theta$, validation loans", COLORS["ours"], x, out.theta_val.to_numpy(), out.gap_val.to_numpy()),
-                   (r"$\hat\theta$, 2015 loans without outcomes", C2015, x, out.theta_2015.to_numpy(),
-                    out.gap_2015.to_numpy())])
-    print(f"\nSaved to {RES}  [{time.time() - t0:.0f}s]")
-
-
-def quintiles():
-    """Default rate and loss per default by fifth of loan amount, on the 2015 loans."""
-    pool = pd.read_parquet(DATA / "pool_preds.parquet")
-    col = next((c for c in ("loan_amnt", "loan_amount", "funded_amnt", "amount") if c in pool.columns), None)
-    if col is None:
-        raise SystemExit(f"No loan amount column found. Columns: {list(pool.columns)}")
-    q = pd.qcut(pool[col], 5, labels=["1 (smallest)", "2", "3", "4", "5 (largest)"])
-    d = pool.y == 1
-    tab = pd.DataFrame({"default rate": pool.groupby(q, observed=True).y.mean(),
-                        "loss per default ($)": pool[d].groupby(q[d], observed=True).c1_true.mean()})
-    print(f"2015 loans: {len(pool):,}, overall default rate {pool.y.mean():.4f}, amount column '{col}'")
-    print(tab.round(4).to_string())
-    print(f"largest / smallest fifth, loss per default: {tab.iloc[-1, 1] / tab.iloc[0, 1]:.2f}")
-
-
-def delay(n_splits):
-    """Calibration on earlier loans (Discussion). In deployment the calibration loans must have known outcomes and are
-    therefore older than the new applicants. Here the calibration sample is drawn from the validation loans (before
-    2015) and the rule is evaluated on the 2015 test halves. As a reference, the same rule with the same weight is
-    calibrated on the 2015 calibration halves, as in Table 1.
-
-    Each split: the validation loans are cut at random into two halves. Half A gives theta_hat (no labels), half B is
-    the earlier calibration sample, so that theta_hat does not depend on the calibration sample (Theorem 2). The 2015
-    pool is split by split_pool, as in run. Coverage CRC and severity CRC are applied to the same score.
-    """
-    t0 = time.time()
-    RES.mkdir(parents=True, exist_ok=True)
-    _, pv, cv, yv, lv = load("val_preds.parquet")
-    _, pp, cp, yp, lp = load("pool_preds.parquet")
-    tau = np.quantile(lv[yv == 1], CAT_QUANTILE)
-    alphas = np.array(LEVELS)
-    print(f"Validation loans {len(pv):,} (halves of {len(pv) // 2:,}), 2015 loans {len(pp):,}", flush=True)
-
-    recs = []
-    for seed in range(n_splits):
-        rng = np.random.default_rng(10_000 + seed)
-        perm = rng.permutation(len(pv))
-        A, Bv = perm[: len(pv) // 2], perm[len(pv) // 2:]
-        ci, ti = split_pool(len(pp), seed=seed)
-        T = Test(yp[ti], lp[ti], tau)
-        p2, c2 = pp[ti], cp[ti]
-        cal = {"earlier": (pv[Bv], cv[Bv], yv[Bv], lv[Bv]), "same period": (pp[ci], cp[ci], yp[ci], lp[ci])}
-        thetas = [dual_theta(pv[A], cv[A], A_COV, a)[0] for a in LEVELS]
-
-        for period, (p1, c1, y1, l1) in cal.items():
-            for j, th in enumerate(thetas):                               # proposed rule
-                s1 = h(th, p1, c1)
-                t = min(cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas[j]))
-                recs.append(dict(seed=seed, period=period, rule="ours", alpha_sev=LEVELS[j], theta=th,
-                                 **T.from_mask(h(th, p2, c2) < t)))
-            for rule, f in [("theta0", lambda p, c: p), ("theta1", lambda p, c: p * c)]:
-                s1, ev = f(p1, c1), T.prefix(f(p2, c2))
-                tc, ts = cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas)
-                for j in range(len(LEVELS)):
-                    recs.append(dict(seed=seed, period=period, rule=rule, alpha_sev=LEVELS[j], theta=np.nan,
-                                     **ev(min(tc, ts[j]))))
-        if (seed + 1) % 10 == 0 or seed == 0:
-            print(f"  {seed + 1}/{n_splits} splits  [{time.time() - t0:.0f}s]", flush=True)
-
-    runs = pd.DataFrame(recs)
-    g = runs.groupby(["period", "rule", "alpha_sev"])
-    summ = g[["miss", "harm", "hl", "review"]].mean().join(
-        (g[["miss", "harm", "review"]].std() / np.sqrt(n_splits)).add_prefix("se_")).reset_index()
-    summ["cov_used"] = 100 * summ.miss / A_COV
-    summ["sev_used"] = 100 * summ.harm / summ.alpha_sev
-    summ["z_cov"] = (summ.miss - A_COV) / summ.se_miss.clip(lower=1e-12)
-    summ["z_sev"] = (summ.harm - summ.alpha_sev) / summ.se_harm.clip(lower=1e-12)
-    summ.to_csv(RES / "lc_delay_summary.csv", index=False)
-
+    w = runs.pivot_table(index=["seed", "m", "alpha_sev"], columns="rule", values="accept")
+    d = (w["dual"] - w["lab"]).rename("diff").reset_index()
+    both = runs[runs.rule == "dual"].groupby("alpha_sev").both.mean()
+    mid = both.index[both > 0.5]
+    acc = runs.groupby(["m", "alpha_sev", "rule"]).accept.mean().unstack("rule")
+    out = pd.DataFrame({
+        "dual_main": acc.xs(MAIN, level="alpha_sev")["dual"],
+        "lab_main": acc.xs(MAIN, level="alpha_sev")["lab"],
+        "diff_main": d[np.isclose(d.alpha_sev, MAIN)].groupby("m")["diff"].mean(),
+        "se_diff_main": d[np.isclose(d.alpha_sev, MAIN)].groupby("m")["diff"].std() / np.sqrt(n_splits),
+        "diff_mean_two_pos": d[d.alpha_sev.isin(mid)].groupby("m")["diff"].mean(),
+        "lab_accepts_none_main": runs[(runs.rule == "lab") & np.isclose(runs.alpha_sev, MAIN)]
+        .groupby("m").accept.apply(lambda a: 100 * (a == 0).mean()),
+    })
+    out.to_csv(RES / "lc_labels.csv")
     pd.set_option("display.width", 220)
-    cols = ["review", "cov_used", "sev_used", "z_cov", "z_sev"]
-    print(f"\nAt alpha_sev = ${MAIN:.0f} (coverage and severity used in % of each level, excess in standard errors):")
-    print(summ[summ.alpha_sev == MAIN].set_index(["rule", "period"])[cols].round(2).to_string())
-    print("\nOver all 21 levels:")
-    agg = summ.groupby(["rule", "period"]).agg(
-        levels_cov_exceeded=("z_cov", lambda z: int((z > 2).sum())),
-        levels_sev_exceeded=("z_sev", lambda z: int((z > 2).sum())),
-        max_cov_used=("cov_used", "max"), max_sev_used=("sev_used", "max"),
-        mean_cov_used=("cov_used", "mean"), mean_sev_used=("sev_used", "mean"))
-    print(agg.round(1).to_string())
-    print("(exceeded = mean above the level by more than 2 standard errors)")
-    o = summ[summ.rule == "ours"].pivot(index="alpha_sev", columns="period", values=["cov_used", "sev_used", "review"])
-    print("\nProposed rule by level:")
-    print(o.round(1).to_string())
-    print(f"\nSaved lc_delay_summary.csv to {RES}  [{time.time() - t0:.0f}s]")
+    print(f"\nPast outcomes m (random split). Share accepted (%) at ${MAIN:g}, plug-in dual minus past labels (pp), "
+          f"and the mean difference over the {len(mid)} levels where both plug-in prices are positive:")
+    print(out.round(2).to_string())
+    print(f"lab_accepts_none_main: % of splits in which the weight chosen on past labels accepts no one at ${MAIN:g}")
+    curve = runs[runs.alpha_sev.isin(mid)].groupby(["m", "rule"]).accept.mean().rename("accept").reset_index()
+    curve.to_csv(RES / "lc_labels_curve.csv", index=False)
+    labels_figure(out)
+    print(f"\nSaved lc_labels.csv, lc_labels_curve.csv and fig_lc_labels.png to {RES}  [{time.time() - t0:.0f}s]")
 
 
-def plug_cut(score, p, c, a_cov, a_sev):
-    """Plug-in cut-off without calibration. Passes the cases with the lowest score for as long as the estimated
-    coverage risk sum p_hat / sum p_hat and the estimated severity sum p_hat c_hat / n stay within the levels.
-    Uses p_hat and c_hat only, no outcomes. The rule passes score < t."""
-    n = len(score)
-    o = np.argsort(score, kind="stable")
-    ok = (np.cumsum(p[o]) <= a_cov * p.sum() + 1e-12) & (np.cumsum(p[o] * c[o]) <= n * a_sev + 1e-9)
-    k = int(np.argmin(ok)) if not ok.all() else n                  # number of cases passed
-    return -np.inf if k == 0 else (np.inf if k == n else float(score[o][k]))
-
-
-def plugin(n_splits):
-    """Plug-in rule without conformal calibration (Section 6). Same weight theta_hat as the proposed rule, but the
-    cut-off is set from p_hat and c_hat on the 2015 calibration half without its outcomes, as a lender would do who
-    trusts the model. Compared with the proposed rule (calibrated with outcomes) on the same test halves."""
-    t0 = time.time()
-    RES.mkdir(parents=True, exist_ok=True)
-    _, pv, cv, yv, lv = load("val_preds.parquet")
-    _, pp, cp, yp, lp = load("pool_preds.parquet")
-    tau = np.quantile(lv[yv == 1], CAT_QUANTILE)
-    alphas = np.array(LEVELS)
-    thetas = [dual_theta(pv, cv, A_COV, a)[0] for a in LEVELS]           # as in run: validation loans, no labels
-
-    recs = []
-    for seed in range(n_splits):
-        ci, ti = split_pool(len(pp), seed=seed)
-        p1, c1, y1, l1 = pp[ci], cp[ci], yp[ci], lp[ci]
-        p2, c2 = pp[ti], cp[ti]
-        T = Test(yp[ti], lp[ti], tau)
-        for j, th in enumerate(thetas):
-            s1, s2 = h(th, p1, c1), h(th, p2, c2)
-            t_conf = min(cut_cov(s1, y1, A_COV), cut_sev(s1, l1, alphas[j]))
-            t_plug = plug_cut(s1, p1, c1, A_COV, alphas[j])
-            recs.append(dict(seed=seed, rule="ours", alpha_sev=LEVELS[j], theta=th, **T.from_mask(s2 < t_conf)))
-            recs.append(dict(seed=seed, rule="plugin", alpha_sev=LEVELS[j], theta=th, **T.from_mask(s2 < t_plug)))
-        if (seed + 1) % 10 == 0 or seed == 0:
-            print(f"  {seed + 1}/{n_splits} splits  [{time.time() - t0:.0f}s]", flush=True)
-
-    runs = pd.DataFrame(recs)
-    g = runs.groupby(["rule", "alpha_sev"])
-    summ = g[["miss", "harm", "hl", "review"]].mean().join(
-        (g[["miss", "harm", "review"]].std() / np.sqrt(n_splits)).add_prefix("se_")).reset_index()
-    summ["cov_used"] = 100 * summ.miss / A_COV
-    summ["sev_used"] = 100 * summ.harm / summ.alpha_sev
-    summ["z_cov"] = (summ.miss - A_COV) / summ.se_miss.clip(lower=1e-12)
-    summ["z_sev"] = (summ.harm - summ.alpha_sev) / summ.se_harm.clip(lower=1e-12)
-    summ.to_csv(RES / "lc_plugin_summary.csv", index=False)
-
-    pd.set_option("display.width", 220)
-    cols = ["review", "cov_used", "sev_used", "z_cov", "z_sev"]
-    print(f"\nAt alpha_sev = ${MAIN:.0f} (level used in %, excess in standard errors):")
-    print(summ[summ.alpha_sev == MAIN].set_index("rule")[cols].round(2).to_string())
-    print("\nOver all 21 levels:")
-    agg = summ.groupby("rule").agg(
-        levels_cov_exceeded=("z_cov", lambda z: int((z > 2).sum())),
-        levels_sev_exceeded=("z_sev", lambda z: int((z > 2).sum())),
-        levels_any_exceeded=("alpha_sev", lambda a: 0),
-        max_cov_used=("cov_used", "max"), max_sev_used=("sev_used", "max"))
-    any_ex = summ.assign(e=(summ.z_cov > 2) | (summ.z_sev > 2)).groupby("rule").e.sum()
-    agg["levels_any_exceeded"] = any_ex.astype(int)
-    print(agg.round(1).to_string())
-    print("(exceeded = mean above the level by more than 2 standard errors)")
-    w = summ.pivot(index="alpha_sev", columns="rule", values=["cov_used", "sev_used", "review"])
-    print("\nBy level:")
-    print(w.round(1).to_string())
-    print(f"\nSaved lc_plugin_summary.csv to {RES}  [{time.time() - t0:.0f}s]")
+def check(n_cases=50_000):
+    """plugin_theta and plugin_prices against linprog (dual_theta) on one sample of 2015 loans, at a few levels."""
+    _, pp, cp, _, _ = load("pool_preds.parquet")
+    idx = np.random.default_rng(1).choice(len(pp), min(n_cases, len(pp)), replace=False)
+    lv = [5.0, 10.0, 25.0, 40.0, MAIN, 80.0, 100.0]
+    fast = plugin_theta(pp[idx], cp[idx], A_COV, lv)
+    pos_cov, pos_sev = plugin_prices(pp[idx], cp[idx], A_COV, lv)
+    for a, f, pc_, ps_ in zip(lv, fast, pos_cov, pos_sev):
+        th, lam = dual_theta(pp[idx], cp[idx], A_COV, a)
+        print(f"  alpha_sev ${a:>5.1f}: theta linprog {th:.4f}, fast {f:.4f};  positive prices linprog "
+              f"({lam[0] > 1e-9}, {lam[1] > 1e-9}), fast ({bool(pc_)}, {bool(ps_)})")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="LendingClub experiments (Section 6)")
+    ap = argparse.ArgumentParser(description="LendingClub experiments (Section 5.4, Appendix D)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "shift", "delay", "plugin"):
+    for name in ("table", "labels", "figs"):
         sp = sub.add_parser(name)
-        sp.add_argument("--n", type=int, default=100, help="number of random calibration/test splits")
-    sub.add_parser("figs")
-    sub.add_parser("quintiles")
+        if name != "figs":
+            sp.add_argument("--n", type=int, default=50 if name == "labels" else 100, help="number of random splits")
+        sp.add_argument("--main", type=float, default=40.0, help="main level in $ (Table 1, fig_lc_splits)")
+    sub.add_parser("check")
     args = ap.parse_args()
-    if args.cmd == "run":
-        run(args.n)
-    elif args.cmd == "shift":
-        shift(args.n)
-    elif args.cmd == "delay":
-        delay(args.n)
-    elif args.cmd == "plugin":
-        plugin(args.n)
-    elif args.cmd == "figs":
-        figures(pd.read_csv(RES / "lc_summary.csv"), pd.read_csv(RES / "lc_levels.csv"))
-        print(f"Redrew fig_lc_frontier.png and fig_lc_weight.png in {RES}")
+    if hasattr(args, "main"):
+        MAIN = args.main
+        LEVELS = sorted(set(GRID_LEVELS + [MAIN]))
+    if args.cmd == "table":
+        table(args.n)
+    elif args.cmd == "labels":
+        labels(args.n)
+    elif args.cmd == "check":
+        check()
     else:
-        quintiles()
+        figures(pd.read_csv(RES / "lc_table1_levels.csv"), pd.read_csv(RES / "lc_table1_runs.csv"))
+        print(f"Redrew fig_lc_levels.png and fig_lc_splits.png in {RES}")
+        if (RES / "lc_labels.csv").exists():
+            labels_figure(pd.read_csv(RES / "lc_labels.csv", index_col="m"))
+            print(f"Redrew fig_lc_labels.png in {RES} from lc_labels.csv (main level of that run)")

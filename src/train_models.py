@@ -1,5 +1,5 @@
 """
-Train the three plug-in models on 2012-2014 loans and predict on the 2015 pool.
+Train the three plug-in models on 2012-2014 loans and predict on the 2015 pool and the pre-2015 hold set.
 
   p_hat(x)  : P(default | x)                    LGBMClassifier, all train rows
   c1_hat(x) : E[c1 | x, Y=1] = ratio * loan_amnt  LGBMRegressor on defaults only
@@ -7,7 +7,8 @@ Train the three plug-in models on 2012-2014 loans and predict on the 2015 pool.
 
 Outputs (data/processed/):
   pool_preds.parquet  - 2015 pool, row order preserved (split_pool indexes into it)
-  val_preds.parquet   - validation set, for calibration diagnostics
+  val_preds.parquet   - validation set (used for early stopping, so not a calibration set)
+  hold_preds.parquet  - pre-2015 hold set, never used in training (calibration on past customers)
 
 Usage (repo root):
     python src/train_models.py
@@ -94,7 +95,7 @@ def add_predictions(df, X, clf, reg1, reg0):
 
 if __name__ == "__main__":
     df = pd.read_parquet(DATA / "lc36_2012_2015.parquet")
-    train_df, val_df, pool_df = load_splits(df)
+    train_df, val_df, hold_df, pool_df = load_splits(df, return_hold=True)
 
     # Leakage guard
     assert not set(FEATURES) & set(LEAK_COLS), set(FEATURES) & set(LEAK_COLS)
@@ -103,6 +104,7 @@ if __name__ == "__main__":
     categories = {c: sorted(train_df[c].unique()) for c in CAT_COLS}
     X_tr = prepare_X(train_df, categories)
     X_va = prepare_X(val_df, categories)
+    X_hold = prepare_X(hold_df, categories)
     X_pool = prepare_X(pool_df, categories)
     y_tr, y_va = train_df["y"].to_numpy(), val_df["y"].to_numpy()
 
@@ -123,8 +125,10 @@ if __name__ == "__main__":
 
     # Predict and save (pool row order preserved)
     val_preds = add_predictions(val_df, X_va, clf, reg1, reg0)
+    hold_preds = add_predictions(hold_df, X_hold, clf, reg1, reg0)
     pool_preds = add_predictions(pool_df, X_pool, clf, reg1, reg0)
     val_preds.to_parquet(DATA / "val_preds.parquet", index=False)
+    hold_preds.to_parquet(DATA / "hold_preds.parquet", index=False)
     pool_preds.to_parquet(DATA / "pool_preds.parquet", index=False)
 
     # ---------- Checks ----------
@@ -133,13 +137,13 @@ if __name__ == "__main__":
         print(f"  {name:9s} {m.best_iteration_}  (cap {LGB_PARAMS['n_estimators']})")
 
     print("\nClassifier: AUC / logloss / mean p_hat vs actual default rate")
-    for name, d in [("val", val_preds), ("pool", pool_preds)]:
+    for name, d in [("val", val_preds), ("hold", hold_preds), ("pool", pool_preds)]:
         print(f"  {name:4s} AUC {roc_auc_score(d['y'], d['p_hat']):.4f}  "
               f"logloss {log_loss(d['y'], d['p_hat']):.4f}  "
               f"mean p_hat {d['p_hat'].mean():.4f}  actual {d['y'].mean():.4f}")
 
     print("\nCalibration curve (10 quantile bins): mean p_hat -> actual rate")
-    for name, d in [("val", val_preds), ("pool", pool_preds)]:
+    for name, d in [("val", val_preds), ("hold", hold_preds), ("pool", pool_preds)]:
         frac_pos, mean_pred = calibration_curve(d["y"], d["p_hat"],
                                                 n_bins=10, strategy="quantile")
         print(f"  {name}")
@@ -158,3 +162,4 @@ if __name__ == "__main__":
 
     print(f"\nSaved: {DATA / 'pool_preds.parquet'}  ({len(pool_preds):,} rows)")
     print(f"Saved: {DATA / 'val_preds.parquet'}  ({len(val_preds):,} rows)")
+    print(f"Saved: {DATA / 'hold_preds.parquet'}  ({len(hold_preds):,} rows)")
